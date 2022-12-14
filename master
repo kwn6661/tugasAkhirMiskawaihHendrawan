@@ -1,0 +1,866 @@
+from contextlib import redirect_stdout
+from fileinput import filename
+from sre_parse import State
+import time
+from wave import Wave_write                         #memasukkan delay
+import serial                       #komunikasi dengan osiloskop
+import numpy as np                       #fungsi matematika
+import scipy
+import pandas as pd                 #statistik
+import matplotlib.pyplot as plt     #plotting grafik
+import csv
+import ast
+import struct
+import itertools
+
+arduinoData = serial.Serial('COM7', 115200, timeout=1)  #membaca data string dari port serial
+state = 0
+data = []
+header = []
+rows = []
+newData = []
+wave = []
+wave2 = []
+ZrCal = []
+ZimCal = []
+pltZr = []
+pltZim = []
+zet0 = []
+zet3 = []
+zet5 = []
+zet7 = []
+frekIs = 0
+csvName = 'tesfft.csv'
+figName = 'tesfft.png'
+modifierB = 1/2.984e-06
+modifierA = 1.029e-08
+maxFrek = 10000
+vin=0
+vout=0
+
+
+def dataZ():
+    listZ = {
+        "Frekuensi": np.linspace(0, maxFrek, maxFrek),
+        "ZReal" : np.zeros(maxFrek),
+        "ZImag": np.zeros(maxFrek)
+    }
+
+def init() : #Kode yang dimainkan pertama kali
+    print("Initializing...")
+    while (arduinoData.inWaiting()==0):         #menunggu adanya data masuk ke port serial\
+        time.sleep(0.1)
+        arduinoData.write("*idn?".encode())
+        time.sleep(0.1)
+        pass
+    Stringbuf = arduinoData.readline()
+    print("Executing code")
+
+def mFlush(): #Mengosongkan data yang dikirimkan osiloskop (masih kurang efektif)
+    while (arduinoData.inWaiting()!=0):
+        Stringbuf = arduinoData.readline()
+
+def updateState(): #Mengetahui apakah osiloskop sedang mengukur atau tidak
+    global state
+    mFlush()
+    for x in range(10): 
+        time.sleep(0.1)
+        arduinoData.write(":trigger:state?".encode())
+    time.sleep(0.1)
+    Stringbuf = arduinoData.readline().strip()
+    state = (Stringbuf)
+    mFlush()
+
+def green() : #Berikan perintah pada osiloskop untuk mengupdate waveform pengukuran
+    global state
+    for x in range(40):
+        time.sleep(0.1)
+        arduinoData.write("*run".encode())
+    for x in range(40):
+        time.sleep(0.1)
+        arduinoData.write(":refresh".encode())
+    mFlush()
+    updateState()
+    if state == 1:
+        green()
+
+def red() : #Berikan perintah pada osiloskop untuk berhenti mengukur
+    global state
+    for x in range(40):
+        time.sleep(0.1)
+        arduinoData.write("*stop".encode())
+    mFlush()
+    updateState()
+    if state == 0:
+        red()
+        mFlush()
+    mFlush()
+
+def acquire(): #Berikan perintah pada osiloskop untuk mengirimkan data, kode ini harus didahulukan oleh fungsi red
+    for x in range(5):
+        time.sleep(0.1)
+        #print("Acquiring Data from Channel 1...")
+        arduinoData.write(':acquire1:memory?:'.encode())
+        time.sleep(1)
+
+def acquire2(): #Berikan perintah pada osiloskop untuk mengirimkan data, kode ini harus didahulukan oleh fungsi red
+    for x in range(5):
+        time.sleep(0.1)
+        #print("Acquiring Data from Channel 2...")
+        arduinoData.write(':acquire2:memory?:'.encode())
+        time.sleep(1)
+
+
+def osiloskop(): #Merekam data yang dikirimkan osiloskop ke CSV
+    global wave
+    mFlush()
+    acquire()
+    f = open(csvName, 'w', newline='')
+    writer = csv.writer(f)
+    x=0
+    wave.clear()
+    data.clear()
+    time.sleep(0.1)
+    while int(sum(data)) < 8014:
+        Stringbuf = arduinoData.readline()        #objek untuk data yang masuk
+        if Stringbuf!=b'1\n' and Stringbuf!=b'0\n' and Stringbuf!=b'':
+            writer.writerow(Stringbuf)
+            wave.append(Stringbuf)
+            data.append(len(Stringbuf))
+            #print(Stringbuf)
+        if Stringbuf==b'':
+            #print("x")
+            acquire()
+        x=x+1
+    mFlush()
+    f.close()
+    print('Channel 1 Waveform Recorded')
+
+def osiloskop2(): #Merekam data yang dikirimkan osiloskop ke CSV
+    global wave2
+    mFlush()
+    acquire2()
+    f = open(csvName, 'w', newline='')
+    writer = csv.writer(f)
+    x=0
+    wave2.clear()
+    data.clear()
+    time.sleep(0.1)
+    while int(sum(data)) < 8014:
+        Stringbuf = arduinoData.readline()        #objek untuk data yang masuk
+        if Stringbuf!=b'1\n' and Stringbuf!=b'0\n' and Stringbuf!=b'':
+            writer.writerow(Stringbuf)
+            wave2.append(Stringbuf)
+            data.append(len(Stringbuf))
+            #print(Stringbuf)
+        if Stringbuf==b'':
+            #print("x")
+            acquire2()
+        x=x+1
+    mFlush()
+    f.close()
+    print('Channel 2 Waveform Recorded')
+
+def dataId() : #Identifikasi jenis data yang dikirimkan oleh osiloskop
+    global header
+    global dsd
+    global dataS2
+    global intervalT
+    dsd = int(chr(int(header[int(1)])))
+    dataS = []
+    print("Data Size Digit = ", dsd) #print data size digit
+    i = 0
+    for i in range(dsd) :
+        dataS.append(chr(int(header[int(i+2)])).encode("ISO-8859-1").decode("ISO-8859-1"))
+    dataS2 = ''.join(dataS) 
+    print("Data Size = ", dataS2) #print data size
+    i = 0
+    timeBytes = struct.pack('>BBBB', int(header[int(9)]), int(header[int(8)]), int(header[int(7)]), int(header[int(6)]))
+    intervalT = np.frombuffer(timeBytes, dtype=np.float32)[0]
+    print("Time Interval = ", intervalT)#print interval antara 2 titik pengukuran, floating-point with little endian format
+    channelIs = int(header[int(6+dsd)])
+    print("Channel = ", channelIs) #print channel yang mengirim data
+    i=0
+
+def dataId2() : #Identifikasi jenis data yang dikirimkan oleh osiloskop
+    global wave2
+    global dsd
+    global dataS2
+    global intervalT
+    global newData
+    newData = list(itertools.chain.from_iterable(wave2))
+    dsd = int(newData[int(1)])
+    dataS = []
+    print("Data Size Digit = ", dsd) #print data size digit
+    i = 0
+    for i in range(dsd) :
+        dataS.append(chr(int(newData[int(i+2)])).encode("ISO-8859-1").decode("ISO-8859-1"))
+    dataS2 = ''.join(dataS) 
+    print("Data Size = ", dataS2) #print data size
+    i = 0
+    timeBytes = struct.pack('>BBBB', int(newData[int(9)]), int(newData[int(8)]), int(newData[int(7)]), int(newData[int(6)]))
+    intervalT = np.frombuffer(timeBytes, dtype=np.float32)[0]
+    print("Time Interval = ", intervalT)#print interval antara 2 titik pengukuran, floating-point with little endian format
+    channelIs = int(newData[int(6+dsd)])
+    print("Channel = ", channelIs) #print channel yang mengirim data
+    i=0
+
+def plotData(): #ubah data dari osiloskop ke floating point dan menampilkannya di grafik
+    print("Converting Data")
+    global rows
+    global intervalT
+    global wave
+    global vout
+    newData = []
+    rows = []
+    temp = []
+    newData.clear()
+    newData = list(itertools.chain.from_iterable(wave))
+    time.sleep(1)
+    #dataId2()
+    #temp = []
+    i=14
+    highest = 0
+    lowest = 1
+    highestR = 0
+    lowestR = 1
+    totalData = len(newData)-14
+    for x in range(4000):
+        FP16 = struct.pack('>BB', int(newData[int(i+1)]), int(newData[int(i)]))
+        converter = np.frombuffer(FP16, dtype=np.float16)[0]
+        newConverter = converter*modifierB
+        if highest < newConverter :
+            highest = newConverter
+        if lowest > newConverter :
+            lowest = newConverter
+        temp.append(newConverter)
+        i=i+2
+    #for x in range(len(temp)):
+    #    temp[x] = temp[x] - modifierA
+    #print("highest is", highest)
+    #print("lowest is", lowest)
+    t = np.linspace(0, len(temp), len(temp))
+    vout = temp
+    timeBytes = struct.pack('>BBBB', int(newData[int(9)]), int(newData[int(8)]), int(newData[int(7)]), int(newData[int(6)]))
+    intervalT = np.frombuffer(timeBytes, dtype=np.float32)[0]
+    
+def plotData2() :
+    print("Converting Data")
+    global rows
+    global intervalT
+    global wave2
+    global vin
+    newData = []
+    rows.clear
+    temp = []
+    temp.clear()
+    newData = list(itertools.chain.from_iterable(wave2))
+    time.sleep(1)
+    #dataId2()
+    #temp = []
+    i=14
+    highest = 0
+    lowest = 1
+    highestR = 0
+    lowestR = 1
+    totalData = len(newData)-14
+    for x in range(4000):
+        FP16 = struct.pack('>BB', int(newData[int(i+1)]), int(newData[int(i)]))
+        converter = np.frombuffer(FP16, dtype=np.float16)[0]
+        newConverter = converter*modifierB
+        if highest < newConverter :
+            highest = newConverter
+        if lowest > newConverter :
+            lowest = newConverter
+        temp.append(newConverter)
+        i=i+2
+    #for x in range(len(temp)):
+    #    temp[x] = temp[x] - modifierA
+    #print("highest is", highest)
+    #print("lowest is", lowest)
+    t = np.linspace(0, len(temp), len(temp))
+    vin = temp
+    timeBytes = struct.pack('>BBBB', int(newData[int(9)]), int(newData[int(8)]), int(newData[int(7)]), int(newData[int(6)]))
+    intervalT = np.frombuffer(timeBytes, dtype=np.float32)[0]
+    #print(intervalT)
+    #print(len(temp))
+    
+
+def fftSin(x1, x2, sr, t):
+    global ZrCal
+    global ZimCal
+    global intervalT
+    rGain = 1000
+    sr = 1/sr
+    X1 = scipy.fft.fft(x1)
+    X2 = scipy.fft.fft(x2)
+    X1abs = np.abs(X1)
+    X2abs = np.abs(X2)
+    N1 = len(X1)
+    N2 = len(X2)
+    n = np.arange(N1)
+    T = N1/sr
+    freq = n/T
+    freqs1 = scipy.fft.fftfreq(len(X1))
+    freqs2 = scipy.fft.fftfreq(len(X2))
+    idx1 = np.argsort(np.abs(X1))[-2]
+    idx2 = np.argsort(np.abs(X2))[-2]
+    dcIdx = np.argsort(np.abs(X1))[-1]
+    X1[dcIdx] = 0
+    X2[dcIdx] = 0
+    main_F_X1 = freqs1[idx1]
+    main_F_X2 = freqs2[idx2]
+    freq_in_hertz1 = abs(main_F_X1 / intervalT)
+    freq_in_hertz2 = abs(main_F_X2 / intervalT)
+    
+
+    zet = (X1[idx1]/X2[idx2])
+
+    ZrCal.append(np.abs(zet.real*rGain))
+    ZimCal.append(np.abs(zet.imag*rGain))
+
+    plt.figure(figsize = (12, 6))
+
+    plt.subplot(231)
+    plt.stem(np.abs(zet.real*rGain), np.abs(zet.imag*rGain))
+    plt.title("Nyquist Plot")
+    plt.xlabel('Zreal')
+    plt.ylabel('Zimag')
+
+    plt.subplot(232)
+    plt.plot(t, x1, 'r')
+    plt.title("Sinyal Masukan")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude(V)')
+
+    plt.subplot(233)
+    plt.plot(t, x2, 'r')
+    plt.title("Sinyal Keluaran")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (V)')
+
+    plt.subplot(235)
+    plt.stem(freq, np.abs(X1))
+    plt.title("FFT Masukan")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(0, 100)
+
+    plt.subplot(236)
+    plt.stem(freq, np.abs(X2))
+    plt.title("FFT Keluaran")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(0, 100)
+
+    plt.subplot(234)
+    rSer = 1000
+    rPar = 1000
+    cap = 1E-06
+    fMax = 40000
+    f = np.linspace(1,fMax,fMax)
+    w = 2*np.pi*np.linspace(1,fMax,fMax)
+    x = (rSer+rPar+(w*rPar*cap)**2*rSer)/(1+(w*rPar*cap)**2)
+    y = (w*rPar**2*cap)/(1+(w*rPar*cap)**2)
+    plt.plot(x, y, 'r')
+    plt.scatter(ZrCal, ZimCal, c='#ff7f0e')
+    plt.title("Akurasi")
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+
+    print("Input", X1[idx1].real, "-i", X1[idx1].imag)
+    print("Output", X2[idx2].real/rGain, "-i", X2[idx2].imag/rGain)
+    print("Hasil", np.abs(zet.real*rGain), "-i", np.abs(zet.imag*rGain))
+    
+    #print(len(X1), len(X2))
+    plt.tight_layout()
+    
+def fftSinAvg(x1, x2, sr, t):
+    global ZrCal
+    global ZimCal
+    global intervalT
+    sr = 1/sr
+    X1 = scipy.fft.fft(x1)
+    X2 = scipy.fft.fft(x2)
+    X1abs = np.abs(X1)
+    X2abs = np.abs(X2)
+    N1 = len(X1)
+    N2 = len(X2)
+    n = np.arange(N1)
+    T = N1/sr
+    freq = n/T
+    freqs1 = scipy.fft.fftfreq(len(X1))
+    freqs2 = scipy.fft.fftfreq(len(X2))
+    idx1 = np.argsort(np.abs(X1))[-2]
+    idx2 = np.argsort(np.abs(X2))[-2]
+    main_F_X1 = freqs1[idx1]
+    main_F_X2 = freqs2[idx2]
+    freq_in_hertz1 = abs(main_F_X1 / intervalT)
+    freq_in_hertz2 = abs(main_F_X2 / intervalT)
+
+    zet = (X1[idx1]/X2[idx1])
+    zetX1 = X1[idx1].real-X1[idx1].imag
+    zetX2 = X2[idx1].real-X2[idx1].imag
+
+
+    ZrCal.append(np.abs(zet.real*1000))
+    ZimCal.append(np.abs(zet.imag*1000))
+    ZrAvg = sum(ZrCal)/len(ZrCal)
+    ZimAvg = sum(ZimCal)/len(ZimCal)
+
+
+    plt.figure(figsize = (12, 6))
+
+    plt.subplot(231)
+    plt.stem(np.abs(zet.real*1000), np.abs(zet.imag*1000))
+    plt.title("Nyquist Plot")
+    plt.xlabel('Zreal')
+    plt.ylabel('Zimag')
+
+    plt.subplot(232)
+    plt.plot(t, x1, 'r')
+    plt.title("Sinyal Masukan")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude(V)')
+
+    plt.subplot(233)
+    plt.plot(t, x2, 'r')
+    plt.title("Sinyal Keluaran")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (V)')
+
+    plt.subplot(235)
+    plt.stem(freq, np.abs(X1))
+    plt.title("FFT Masukan")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(2, 2000)
+
+    plt.subplot(236)
+    plt.stem(freq, np.abs(X2))
+    plt.title("FFT Keluaran")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(2, 2000)
+
+    plt.subplot(234)
+    rSer = 1000
+    rPar = 1000
+    cap = 1E-06
+    fMax = 40000
+    f = np.linspace(1,fMax,fMax)
+    w = 2*np.pi*np.linspace(1,fMax,fMax)
+    x = (rSer+rPar+(w*rPar*cap)**2*rSer)/(1+(w*rPar*cap)**2)
+    y = (w*rPar**2*cap)/(1+(w*rPar*cap)**2)
+    plt.plot(x, y, 'r')
+    plt.scatter(ZrAvg, ZimAvg, c='#ff7f0e')
+    plt.title("Akurasi")
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+
+    print("Input", X1[idx1].real, "-i", X1[idx1].imag)
+    print("Output", X2[idx2].real/1000, "-i", X2[idx2].imag/1000)
+    print("Hasil", np.abs(zet.real*1000), "-i", np.abs(zet.imag*1000))
+    
+    #print(len(X1), len(X2))
+    plt.tight_layout()
+
+def cleaning():
+    global ZrCal
+    global ZimCal
+    global pltZr
+    global pltZim
+    
+    ZrAvg = sum(ZrCal)/len(ZrCal)
+    ZrStd = np.std(ZrCal)
+    ZrCutOff = ZrStd*3
+
+    ZimAvg = sum(ZimCal)/len(ZimCal)
+    ZimStd = np.std(ZimCal)
+    ZimCutOff = ZimStd*3
+
+    lowerLimit_r = ZrAvg-ZrCutOff
+    upperLimit_r = ZrAvg+ZrCutOff
+
+    lowerLimit_im = ZimAvg-ZimCutOff
+    upperLimit_im = ZimAvg+ZimCutOff
+    
+    deleteList = []
+    deleteList.clear()
+
+    x = 0
+    z = 0
+    for x in range(len(ZrCal)):
+        if ZrCal[x] > upperLimit_r or ZrCal[x] < lowerLimit_r:
+            deleteList.append(x)
+    x = len(deleteList)-1
+    z = len(deleteList)-1
+    while (z>0):
+        del ZrCal[deleteList[z]]
+        z=z-1
+    print("Deleted list zr=", deleteList)
+
+    deleteList.clear()
+    x = 0
+    z=0
+    for x in range(len(ZimCal)):
+        if ZimCal[x] > upperLimit_im or ZimCal[x] < lowerLimit_im:
+            deleteList.append(x)
+    x = len(deleteList)-1
+    z = len(deleteList)-1
+    while (z>0):
+        del ZimCal[deleteList[z]]
+        z=z-1
+    print("Deleted list zim=", deleteList)
+    
+
+    ZrAvg = sum(ZrCal)/len(ZrCal)
+    ZimAvg = sum(ZimCal)/len(ZimCal)
+    pltZr.append(ZrAvg)
+    pltZim.append(ZimAvg)
+    print("Zr = ", ZrCal)
+    print("Zim = ", ZimCal)
+    plt.subplot(121)
+    plt.stem(ZrAvg, ZimAvg)
+    plt.title("Hasil Data Cleaning")
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+
+    plt.subplot(122)
+    rSer = 1000
+    rPar = 1000
+    cap = 1E-06
+    fMax = 40000
+    f = np.linspace(1,fMax,fMax)
+    w = 2*np.pi*np.linspace(1,fMax,fMax)
+    x = (rSer+rPar+(w*rPar*cap)**2*rSer)/(1+(w*rPar*cap)**2)
+    y = (w*rPar**2*cap)/(1+(w*rPar*cap)**2)
+    plt.plot(x, y, 'r')
+    plt.scatter(pltZr, pltZim, c='#ff7f0e')
+    plt.title("Akurasi")
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+    ZrCal.clear()
+    ZimCal.clear()
+
+def fftSawAvg(x1, x2, sr, t):
+    global ZrCal
+    global ZimCal
+    global intervalT
+    global zet0
+    global zet3
+    global zet5
+    global zet7
+    global frekIs
+    sr = 1/sr
+    X1 = scipy.fft.fft(x1)
+    X2 = scipy.fft.fft(x2)
+    X1abs = np.abs(X1)
+    X2abs = np.abs(X2)
+    N1 = len(X1)
+    N2 = len(X2)
+    n = np.arange(N1)
+    T = N1/sr
+    freq = n/T
+    a = 0
+    zet = []
+    Zr0 = []
+    Zim0 = []
+    zet0 = []
+    zet3 = []
+    zet5 = []
+    zet7 = []
+    idx2Select = []
+    zet.clear()
+    freqs1 = scipy.fft.fftfreq(len(X1))
+    
+    X1Sort = np.argsort(np.abs(X1))
+    X2Sort = np.argsort(np.abs(X2))
+    dcIdx = X2Sort[-1]
+    idx1 = X2Sort[-2]
+    ampDasar = np.abs(X2[idx1])
+    print("ampdasar", ampDasar)
+    idx2 = idx1*3
+    idx3 = idx1*5
+    idx4 = idx1*7
+    print("searching for approx amplitude range at f0*(2n+1)")
+    for a in range(len(X2)):
+        if np.abs(X2[a]) < ((ampDasar/9)+(ampDasar/9*0.36)) and np.abs(X2[a]) > ((ampDasar/9)-(ampDasar/9*0.36)):  
+            idx2Select.append(a)
+            #print(a, np.abs(X2[a]))
+            #idx2 = a
+    #for a in range(len(X2)):
+    #    if np.abs(X2[a]) < (ampDasar/9+9) and np.abs(X2[a]) > (ampDasar/9-10):  
+    #        idx2Select.append(a)        
+    a=0
+    ampsearch = 0
+    print("identifying the right amplitude")
+    for a in range(len(idx2Select)):
+        if np.abs(X2[idx2Select[a]]) > ampsearch :
+            idx2 = idx2Select[a]
+            ampsearch = np.abs(X2[idx2Select[a]])
+            #print("ampsearch", ampsearch)
+    print(idx1, ampDasar)
+    print(idx2, np.abs(X2[idx2]))
+    #print(idx2Select)
+    idx2Select.clear()
+
+
+    for a in range(len(X2)):
+        if np.abs(X2[a]) < ((ampDasar/25)+(ampDasar/25*0.36)) and np.abs(X2[a]) > ((ampDasar/25)-(ampDasar/25*0.36)):  
+            idx2Select.append(a)
+            print("cari f0*5", X2[a])
+            #print(a, np.abs(X2[a]))
+            #idx2 = a
+    #for a in range(len(X2)):
+    #    if np.abs(X2[a]) < (ampDasar/9+9) and np.abs(X2[a]) > (ampDasar/9-10):  
+    #        idx2Select.append(a)        
+    a=0
+    ampsearch = 0
+    for a in range(len(idx2Select)):
+        if np.abs(X2[idx2Select[a]]) > ampsearch :
+            idx3 = idx2Select[a]
+            ampsearch = np.abs(X2[idx2Select[a]])
+            print("ampsearch f0*5", ampsearch)
+    print(idx1, ampDasar)
+    print(idx3, np.abs(X2[idx3]))
+    #print(idx2Select)
+    idx2Select.clear()
+
+    for a in range(len(X2)):
+        if np.abs(X2[a]) < ((ampDasar/49)+(ampDasar/49*0.25)) and np.abs(X2[a]) > ((ampDasar/49)-(ampDasar/49*0.25)):  
+            idx2Select.append(a)
+            #print(a, np.abs(X2[a]))
+            #idx2 = a
+    #for a in range(len(X2)):
+    #    if np.abs(X2[a]) < (ampDasar/9+9) and np.abs(X2[a]) > (ampDasar/9-10):  
+    #        idx2Select.append(a)        
+    a=0
+    ampsearch = 0
+    for a in range(len(idx2Select)):
+        if np.abs(X2[idx2Select[a]]) > ampsearch :
+            idx4 = idx2Select[a]
+            ampsearch = np.abs(X2[idx2Select[a]])
+            print("ampsearch f0*7", ampsearch)
+    print(idx1, ampDasar)
+    #print(idx2Select)
+    idx2Select.clear()
+
+    zet0.append(X1[idx1]/X2[idx1]*1000)
+    zet3.append(X1[idx2]/X2[idx2]*1000)
+    zet5.append(X1[idx3]/X2[idx3]*1000)
+    zet7.append(X1[idx4]/X2[idx4]*1000)
+
+    Zr0.append((X1[idx1]/X2[idx1]).real*1000)
+    Zr0.append((X1[idx2]/X2[idx2]).real*1000)
+    Zr0.append((X1[idx3]/X2[idx3]).real*1000)
+    Zr0.append((X1[idx4]/X2[idx4]).real*1000)
+
+    Zim0.append((X1[idx1]/X2[idx1]).imag*1000)
+    Zim0.append((X1[idx2]/X2[idx2]).imag*1000)
+    Zim0.append((X1[idx3]/X2[idx3]).imag*1000)
+    Zim0.append((X1[idx4]/X2[idx4]).imag*1000)
+
+    freqs2 = scipy.fft.fftfreq(len(X2))
+    main_F_X2 = freqs2[idx1]
+    frekIs = abs(main_F_X2 / intervalT)
+
+    #for a in range(len(zet)):
+   #     ZrCal.append(zet-))
+   #     ZimCal.append(np.abs(zet[a].imag*1000))
+    X1[dcIdx] = 0
+    X2[dcIdx] = 0
+    #ZrAvg = sum(ZrCal)/len(ZrCal)
+    #ZimAvg = sum(ZimCal)/len(ZimCal)
+
+    plt.figure(figsize = (12, 6))
+    plt.subplot(231)
+    plt.stem(np.abs(Zr0), np.abs(Zim0))
+    plt.title("Nyquist Plot")
+    plt.xlabel('Zreal')
+    plt.ylabel('Zimag')
+
+    plt.subplot(232)
+    plt.plot(t, x1, 'r')
+    plt.title("Sinyal Masukan")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude(V)')
+
+    plt.subplot(233)
+    plt.plot(t, x2, 'r')
+    plt.title("Sinyal Keluaran")
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude (V)')
+
+    plt.subplot(235)
+    #plt.scatter(freq, 20*np.log10(np.abs(X1)/X1[idx1]))
+    plt.scatter(freq, (np.abs(X1)))
+    plt.title("FFT Masukan")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(0, 1000)
+
+    plt.subplot(236)
+    #plt.scatter(freq, 20*np.log10(np.abs(X2)/X2[idx1]))
+    plt.scatter(freq, (np.abs(X2)))
+    plt.title("FFT Keluaran")
+    plt.xlabel('F (Hz)')
+    plt.ylabel('Amplitude')
+    plt.xlim(0, 1000)
+
+    plt.subplot(234)
+    rSer = 1000
+    rPar = 1000
+    cap = 1E-06
+    fMax = 40000
+    f = np.linspace(1,fMax,fMax)
+    w = 2*np.pi*np.linspace(1,fMax,fMax)
+    x = (rSer+rPar+(w*rPar*cap)**2*rSer)/(1+(w*rPar*cap)**2)
+    y = (w*rPar**2*cap)/(1+(w*rPar*cap)**2)
+    plt.plot(x, y, 'r')
+    plt.scatter(np.abs(Zr0), np.abs(Zim0), c='#ff7f0e')
+    plt.title("Nyquist Plot")
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+    #plt.xlim(500, 2500)
+
+    rGain = 1000
+    print("Input1", X1[idx1].real, "-i", X1[idx1].imag)
+    print("Output1", X2[idx1].real/rGain, "-i", X2[idx1].imag/rGain)
+    print("Hasil1", (X1[idx1]/X2[idx1]*1000).real, "-i", (X1[idx1]/X2[idx1]*1000).imag)
+
+    #print("Input2", X1[idx2].real, "-i", X2[idx2].imag)
+    #print("Output2", X2[idx2].real/rGain, "-i", X2[idx2].imag/rGain)
+    print("Hasil2", (X1[idx2]/X2[idx2]*1000).real, "-i", (X1[idx2]/X2[idx2]*1000).imag)
+
+    #print("Input3", X1[idx2].real, "-i", X2[idx2].imag)
+    #print("Output3", X2[idx2].real/rGain, "-i", X2[idx2].imag/rGain)
+    print("Hasil3", (X1[idx3]/X2[idx3]*1000).real, "-i", (X1[idx3]/X2[idx3]*1000).imag)
+
+    #print("Input4", X1[idx2].real, "-i", X2[idx2].imag)
+    #print("Output4", X2[idx2].real/rGain, "-i", X2[idx2].imag/rGain)
+    print("Hasil4", (X1[idx4]/X2[idx4]*1000).real, "-i", (X1[idx4]/X2[idx4]*1000).imag)
+    
+    print(ZrCal)
+    print(ZimCal)
+    plt.tight_layout()
+
+def cleaningSaw() : 
+    global zet0
+    global zet3
+    global zet5
+    global zet7
+    global frekIs
+    ZrTri = []
+    ZimTri = []
+
+    zplt0 = sum(zet0)/len(zet0)
+    zplt3 = sum(zet3)/len(zet3)
+    zplt5 = sum(zet5)/len(zet5)
+    zplt7 = sum(zet7)/len(zet7)
+    print("Z f0 avg = ", zplt0)
+    print("Z f0*3 avg = ", zplt3)
+    print("Z f0*5 avg = ", zplt5)
+    print("Z f0*7 avg = ", zplt7)
+
+    ZrTri.append(np.abs(zplt0.real))
+    ZimTri.append(np.abs(zplt0.imag))
+    ZrTri.append(np.abs(zplt3.real))
+    ZimTri.append(np.abs(zplt3.imag))
+    ZrTri.append(np.abs(zplt5.real))
+    ZimTri.append(np.abs(zplt5.imag))
+    ZrTri.append(np.abs(zplt7.real))
+    ZimTri.append(np.abs(zplt7.imag))
+
+    #plt.subplot(121)
+    #plt.stem(zData.real, zData.imag)
+   # plt.title("Hasil Data Cleaning")
+    #plt.xlabel('Z Real')
+    #plt.ylabel('Z Imaginer')
+
+    plt.subplot(122)
+    rSer = 1000
+    rPar = 1000
+    cap = 1E-06
+    fMax = 40000
+    f = np.linspace(1,fMax,fMax)
+    w = 2*np.pi*np.linspace(1,fMax,fMax)
+    x = (rSer+rPar+(w*rPar*cap)**2*rSer)/(1+(w*rPar*cap)**2)
+    y = (w*rPar**2*cap)/(1+(w*rPar*cap)**2)
+    plt.plot(x, y, 'r')
+    plt.scatter(ZrTri, ZimTri, c='#ff7f0e')
+    plt.title(frekIs)
+    plt.xlabel('Z Real')
+    plt.ylabel('Z Imaginer')
+    ZrCal.clear()
+    ZimCal.clear()
+
+if __name__ == "__main__": 
+    init()
+    mFlush()
+    while True :
+        green()
+        print("This is Main Menu, Waiting for your input")
+        print("0 To test single sine ")
+        print("1 To run second experiment")
+        print("2 To run third experiment")
+        print("3 To exit the app")
+        turnto = int(input())
+        if turnto==0:
+            print("commencing experiment 01")
+            red()
+            osiloskop()
+            plotData()
+            red()
+            osiloskop2()
+            plotData2()
+            fftSin(vin, vout, intervalT, np.linspace(0, 4000, 4000))
+            plt.show()
+        if turnto==1:
+            print("commencing experiment 02")
+            refrTime = float(input())
+            for x in range(3):
+                #print("commencing experiment 01")
+                red()
+                osiloskop()
+                plotData()
+                red()
+                osiloskop2()
+                plotData2()
+                fftSinAvg(vin, vout, intervalT, np.linspace(0, 4000, 4000))
+                green()
+                time.sleep(refrTime)
+            cleaning()
+            plt.show()
+        if turnto==2:
+            print("commencing experiment 03")
+            ##for x in range(10):
+            red()
+            osiloskop()
+            plotData()
+            red()
+            osiloskop2()
+            plotData2()
+            fftSawAvg(vin, vout, intervalT, np.linspace(0, 4000, 4000))
+                #    green()
+                #    time.sleep(refrTime)
+                #cleaning()
+            plt.show()
+        if turnto==3:
+            print("commencing experiment 04")
+            refrTime = float(input())
+            ##for x in range(10):
+            for x in range(5):
+                red()
+                osiloskop()
+                plotData()
+                red()
+                osiloskop2()
+                plotData2()
+                fftSawAvg(vin, vout, intervalT, np.linspace(0, 4000, 4000))
+                green()
+                time.sleep(refrTime)
+            cleaningSaw()
+            plt.show()
+        if turnto==4:
+            exit()
